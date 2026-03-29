@@ -13,26 +13,18 @@ Read iMessage, SMS, and RCS conversations from the local macOS Messages database
 
 ## Usage
 
-Find and run the reader script:
+Run the reader script. It lives in `scripts/imessage-reader.py` relative to this skill file:
 
 ```bash
-# Find the script (works for both skills.sh install and manual install)
-IMSG_SCRIPT="$(find ~/.claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-[ -z "$IMSG_SCRIPT" ] && IMSG_SCRIPT="$(find .claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-python3 "$IMSG_SCRIPT" "<contact>" [options]
+python3 "SKILL_DIR/scripts/imessage-reader.py" "<contact>" [options]
 ```
 
-Or reference it directly if you know the install path:
+Replace `SKILL_DIR` with the actual directory where this skill is installed. To find it, run:
 ```bash
-# skills.sh install (project-level)
-python3 .claude/skills/imessage/scripts/imessage-reader.py "<contact>" [options]
-
-# skills.sh install (global)
-python3 ~/.claude/skills/imessage/scripts/imessage-reader.py "<contact>" [options]
-
-# Manual install
-python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
+dirname "$(find ~/.claude -name imessage-reader.py -path '*/scripts/*' 2>/dev/null | head -1)"/../
 ```
+
+Or if installed globally, the script may be at `~/.claude/scripts/imessage-reader.py`.
 
 ### Contact formats
 - **Contact name**: `"Mom"`, `"John Smith"` (looks up phone in macOS AddressBook, partial match works)
@@ -48,12 +40,11 @@ python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
 ### Examples
 
 ```bash
-IMSG="$(find ~/.claude .claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-python3 "$IMSG" "Mom" --today
-python3 "$IMSG" "Family" --days 7
-python3 "$IMSG" "John Smith" --date 2026-03-29
-python3 "$IMSG" "Work Chat" --all --limit 50
-python3 "$IMSG" "+15551234567" --today
+python3 ~/.claude/scripts/imessage-reader.py "Mom" --today
+python3 ~/.claude/scripts/imessage-reader.py "Family" --days 7
+python3 ~/.claude/scripts/imessage-reader.py "John Smith" --date 2026-03-29
+python3 ~/.claude/scripts/imessage-reader.py "Work Chat" --all --limit 50
+python3 ~/.claude/scripts/imessage-reader.py "+15551234567" --today
 ```
 
 ## How it works
