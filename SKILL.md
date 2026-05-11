@@ -4,7 +4,7 @@ description: Read iMessage, SMS, and RCS conversations from the macOS Messages d
 license: MIT
 metadata:
   author: br-schneider
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # iMessage Reader
@@ -38,12 +38,18 @@ python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
 - **Contact name**: `"Mom"`, `"John Smith"` (looks up phone in macOS AddressBook, partial match works)
 - **Phone number**: `"+15551234567"`, `"(555) 123-4567"`, `"5551234567"`
 - **Group chat name**: `"Family"`, `"Work Chat"` (partial match on group display name)
+- **Specific chat by ID**: `--chat-id N` (use `--list-chats` to discover IDs; works for unnamed groups)
 
 ### Time range options
 - `--today` — today's messages (default if no range specified)
 - `--days N` — last N days
 - `--date YYYY-MM-DD` — specific date
 - `--all --limit N` — all messages, most recent N (default limit: 100)
+
+### Discovery options
+- `--list-chats <contact>` — list every chat involving the contact (1:1 + named groups + **unnamed groups**), with each chat's ROWID and last-activity date. Use this when you know someone is in a group chat but don't know its name. Exits after printing.
+- `--chat-id N` — read a specific chat by ROWID. Pair with `--list-chats` to read an unnamed group chat that the default contact search can't reach.
+- `--include-groups` — when searching by contact, return the 1:1 chat AND all group chats containing that contact (instead of just the 1:1). Useful for "show me everything with this person."
 
 ### Examples
 
@@ -54,6 +60,13 @@ python3 "$IMSG" "Family" --days 7
 python3 "$IMSG" "John Smith" --date 2026-03-29
 python3 "$IMSG" "Work Chat" --all --limit 50
 python3 "$IMSG" "+15551234567" --today
+
+# Discover and read an unnamed group chat
+python3 "$IMSG" "John Smith" --list-chats        # prints all chats including unnamed groups
+python3 "$IMSG" --chat-id 2816 --today           # read the unnamed group directly
+
+# Read everything (1:1 + all groups) with a contact
+python3 "$IMSG" "John Smith" --include-groups --days 7
 ```
 
 ## How it works
@@ -83,3 +96,15 @@ When the user says things like "read my messages with Mom" or "what did John tex
 4. Present the conversation to the user, and work with the content as requested
 
 The script resolves contact names from the macOS AddressBook automatically. If a name doesn't match, try a phone number instead.
+
+### When the default search fails
+
+If a user asks about a thread you know exists but `<contact>` returns "No chat found", it's almost certainly an **unnamed group chat** — Apple stores its `chat.chat_identifier` as a GUID and `display_name` is empty, so neither the name nor phone-number searches find it.
+
+Recover with:
+
+```bash
+python3 "$IMSG" "<contact>" --list-chats
+```
+
+This lists every chat the contact appears in, including unnamed groups, with each chat's ROWID. Then read the right one with `--chat-id N`. If the user describes a chat by its participants ("the group chat with Dad and Jorge"), `--list-chats` on either participant will surface it.
