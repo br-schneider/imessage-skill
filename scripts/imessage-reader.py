@@ -22,12 +22,14 @@ import datetime
 import glob
 import os
 import re
+import subprocess
 import sys
 
 MESSAGES_DB = os.path.expanduser("~/Library/Messages/chat.db")
 ADDRESSBOOK_PATTERN = os.path.expanduser(
     "~/Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"
 )
+HEIC_CONVERT_DIR = "/tmp/imessage-attachments"
 
 
 # ── Contact resolution via AddressBook ──────────────────────────────────────
@@ -340,6 +342,135 @@ def get_chat_participants(db: sqlite3.Connection, chat_id: int) -> dict[int, str
     return participants
 
 
+# ── Attachments ─────────────────────────────────────────────────────────────
+
+
+def get_attachments_for_messages(
+    db: sqlite3.Connection, message_rowids: list[int]
+) -> dict[int, list[dict]]:
+    """Fetch attachment metadata for a batch of messages.
+
+    Returns {message_rowid: [{rowid, path, mime, name, size, is_sticker, exists}, ...]}.
+    Filters out:
+      - Rows with NULL mime_type (these are .pluginPayloadAttachment link previews,
+        not user content).
+      - Rows with hide_attachment=1 (Apple flags these as not-for-display).
+      - Rows with no filename.
+    """
+    if not message_rowids:
+        return {}
+    cursor = db.cursor()
+    placeholders = ",".join("?" * len(message_rowids))
+    cursor.execute(
+        f"""
+        SELECT maj.message_id, a.ROWID, a.filename, a.mime_type,
+               a.transfer_name, a.total_bytes, a.is_sticker
+        FROM attachment a
+        JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+        WHERE maj.message_id IN ({placeholders})
+          AND a.filename IS NOT NULL
+          AND a.mime_type IS NOT NULL
+          AND a.hide_attachment = 0
+        ORDER BY maj.message_id, a.ROWID
+        """,
+        message_rowids,
+    )
+    result: dict[int, list[dict]] = {}
+    for msg_id, rowid, filename, mime, name, size, sticker in cursor.fetchall():
+        abs_path = os.path.expanduser(filename)
+        result.setdefault(msg_id, []).append({
+            "rowid": rowid,
+            "path": abs_path,
+            "mime": mime,
+            "name": name or os.path.basename(abs_path),
+            "size": size or 0,
+            "is_sticker": bool(sticker),
+            "exists": os.path.exists(abs_path),
+        })
+    return result
+
+
+def convert_heic_to_jpeg(att: dict) -> str | None:
+    """Convert a HEIC attachment to JPEG using macOS `sips`.
+
+    Output filename is `<attachment_rowid>-<basename>.jpg` in HEIC_CONVERT_DIR.
+    The ROWID prefix prevents collisions when two threads send files with the
+    same basename (e.g., iOS reuses IMG_XXXX.heic numbers across senders).
+    Idempotent: if the JPEG already exists, return its path without re-running.
+    """
+    src = att["path"]
+    if not os.path.exists(src):
+        return None
+    os.makedirs(HEIC_CONVERT_DIR, exist_ok=True)
+    base = os.path.basename(src).rsplit(".", 1)[0]
+    out_path = os.path.join(HEIC_CONVERT_DIR, f"{att['rowid']}-{base}.jpg")
+    if os.path.exists(out_path):
+        return out_path
+    try:
+        result = subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", "1600", src, "--out", out_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and os.path.exists(out_path):
+            return out_path
+    except Exception:
+        pass
+    return None
+
+
+def format_attachment(att: dict, convert_heic: bool) -> str:
+    """Render an attachment as a `[attachment: ...]` token."""
+    mime = att["mime"]
+    path = att["path"]
+
+    if not att["exists"]:
+        return f"[attachment: {mime}, {path} (missing on disk)]"
+
+    if att["is_sticker"]:
+        return f"[sticker: {mime}, {path}]"
+
+    if convert_heic and mime in ("image/heic", "image/heif"):
+        jpeg = convert_heic_to_jpeg(att)
+        if jpeg:
+            return f"[attachment: {mime}, {path} | converted: {jpeg}]"
+
+    return f"[attachment: {mime}, {path}]"
+
+
+def render_message_line(
+    time_str: str, sender: str, text: str, attachments: list[dict], convert_heic: bool
+) -> str:
+    """Build the chat-line output for one message.
+
+    Layout rules:
+      - 0 attachments: `HH:MM | Sender: text`
+      - 1 attachment:  `HH:MM | Sender: text [attachment: ...]` (or just attachment if no text)
+      - 2+ attachments: text on the first line, each attachment on its own indented line
+    """
+    prefix = f"{time_str} | {sender}:"
+    n = len(attachments)
+
+    if n == 0:
+        return f"{prefix} {text}"
+
+    if n == 1:
+        token = format_attachment(attachments[0], convert_heic)
+        if text:
+            return f"{prefix} {text} {token}"
+        return f"{prefix} {token}"
+
+    # 2+: multi-line for readability
+    lines = []
+    lines.append(f"{prefix} {text}" if text else prefix)
+    for att in attachments:
+        lines.append(f"    {format_attachment(att, convert_heic)}")
+    return "\n".join(lines)
+
+
+# ── Messages ────────────────────────────────────────────────────────────────
+
+
 def read_messages(
     db: sqlite3.Connection,
     chat_ids: list[int],
@@ -395,26 +526,43 @@ def read_messages(
         """
 
     cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    # Batch-fetch attachments for messages that flag them.
+    rowids_with_atts = [r[0] for r in rows if r[6]]
+    atts_by_msg = get_attachments_for_messages(db, rowids_with_atts)
 
     messages = []
-    for rowid, date_val, is_from_me, text, attributed_body, handle_id, has_attach in cursor.fetchall():
+    for rowid, date_val, is_from_me, text, attributed_body, handle_id, has_attach in rows:
         ts = datetime.datetime.fromtimestamp(date_val / 1e9 + 978307200)
 
         msg = text
         if not msg and attributed_body:
             msg = extract_text_from_blob(attributed_body)
 
-        # Show attachment indicator if no text
-        if not msg and has_attach:
-            msg = "[attachment]"
-        elif not msg:
+        attachments = atts_by_msg.get(rowid, [])
+
+        # Strip iOS's U+FFFC OBJECT REPLACEMENT CHARACTER — it's the inline
+        # placeholder for "attachment goes here". Once we render the attachment
+        # token explicitly, the placeholder is just noise. Collapse runs of
+        # spaces left behind, but preserve newlines (multi-line messages).
+        if msg:
+            msg = msg.replace("￼", "")
+            msg = "\n".join(re.sub(r" +", " ", line).strip() for line in msg.split("\n"))
+            msg = msg.strip()
+
+        # Skip messages with neither text nor resolvable attachments.
+        # (has_attach=1 with no resolvable attachments usually means the only
+        # "attachment" was a link preview, which we filter out.)
+        if not msg and not attachments:
             continue
 
         messages.append({
             "timestamp": ts,
             "is_from_me": bool(is_from_me),
-            "text": msg,
+            "text": msg or "",
             "handle_id": handle_id,
+            "attachments": attachments,
         })
 
     return messages
@@ -449,6 +597,15 @@ def main():
         "--include-groups",
         action="store_true",
         help="When searching by contact, also include named + unnamed group chats with them",
+    )
+    parser.add_argument(
+        "--convert-heic",
+        action="store_true",
+        help=(
+            "Auto-convert HEIC attachments to JPEG (cached in /tmp/imessage-attachments/) "
+            "so the output includes a readable JPEG path alongside the original HEIC. "
+            "Requires macOS `sips`."
+        ),
     )
 
     args = parser.parse_args()
@@ -564,7 +721,9 @@ def main():
         else:
             sender = resolve_sender(msg["handle_id"])
 
-        print(f"{time_str} | {sender}: {msg['text']}")
+        print(render_message_line(
+            time_str, sender, msg["text"], msg["attachments"], args.convert_heic
+        ))
 
     db.close()
 

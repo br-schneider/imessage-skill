@@ -27,7 +27,8 @@ cp scripts/imessage-reader.py .claude/scripts/imessage-reader.py
 - Resolves contact names from the macOS AddressBook database
 - Filters by contact name, phone number, or group chat name
 - Filters by date (today, last N days, specific date)
-- Shows `[attachment]` for image/file-only messages
+- Surfaces attachments inline as `[attachment: <mime>, <absolute_path>]` so the agent can read the file directly (filters out link-preview rows automatically)
+- Optional `--convert-heic` flag to auto-convert HEIC to JPEG via `sips`, with idempotent caching at `/tmp/imessage-attachments/<rowid>-<basename>.jpg`
 - Read-only database access, zero external dependencies (Python stdlib only)
 
 ## Usage

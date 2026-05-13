@@ -1,10 +1,10 @@
 ---
 name: imessage
-description: Read iMessage, SMS, and RCS conversations from the macOS Messages database. Use when the user asks to read texts, check messages, see what someone said, or look at a group chat. Handles all message types including RCS blobs, resolves contact names from AddressBook, and filters by date.
+description: Read iMessage, SMS, and RCS conversations from the macOS Messages database. Use when the user asks to read texts, check messages, see what someone said, or look at a group chat. Handles all message types including RCS blobs, resolves contact names from AddressBook, surfaces attachment paths inline (with optional HEIC→JPEG conversion), and filters by date.
 license: MIT
 metadata:
   author: br-schneider
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # iMessage Reader
@@ -51,6 +51,9 @@ python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
 - `--chat-id N` — read a specific chat by ROWID. Pair with `--list-chats` to read an unnamed group chat that the default contact search can't reach.
 - `--include-groups` — when searching by contact, return the 1:1 chat AND all group chats containing that contact (instead of just the 1:1). Useful for "show me everything with this person."
 
+### Attachment options
+- `--convert-heic` — auto-convert HEIC attachments to JPEG (cached in `/tmp/imessage-attachments/<rowid>-<basename>.jpg`) so the output includes a readable JPEG path alongside the original HEIC. Required when the agent needs to actually read the image content (HEIC is not directly readable by most image tools). Cached and idempotent across re-runs.
+
 ### Examples
 
 ```bash
@@ -67,6 +70,9 @@ python3 "$IMSG" --chat-id 2816 --today           # read the unnamed group direct
 
 # Read everything (1:1 + all groups) with a contact
 python3 "$IMSG" "John Smith" --include-groups --days 7
+
+# Pull a thread AND auto-convert any HEIC images so the JPEGs are read-ready
+python3 "$IMSG" "Mom" --today --convert-heic
 ```
 
 ## How it works
@@ -76,7 +82,8 @@ The script reads `~/Library/Messages/chat.db` (the macOS iMessage SQLite databas
 - **SMS/RCS**: text stored in the `attributedBody` blob (Apple typedstream format), decoded with proper multi-byte length support for messages of any length
 - **Contact names**: resolved from the macOS AddressBook SQLite database (supports name-based lookup and display)
 - **Tapback reactions**: filtered out automatically
-- **Attachments**: shows `[attachment]` for image/file messages with no text
+- **Attachments**: surfaced inline as `[attachment: <mime>, <absolute_path>]` tokens. Messages with 0–1 attachments stay on one line; messages with 2+ attachments use indented continuation lines for readability. The iOS U+FFFC placeholder character is stripped automatically. Link-preview rows (`.pluginPayloadAttachment` with no MIME) and hidden attachments are filtered out.
+- **HEIC handling**: HEIC files are not directly readable by most image tools. Pass `--convert-heic` to auto-convert via macOS `sips` and surface a JPEG path alongside the original. Conversions are cached at `/tmp/imessage-attachments/<rowid>-<basename>.jpg` and reused on subsequent runs.
 - **Group chats**: resolves participant names from AddressBook where possible
 - **Read-only**: opens databases in read-only mode for safety
 
