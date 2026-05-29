@@ -35,13 +35,16 @@ HEIC_CONVERT_DIR = "/tmp/imessage-attachments"
 # ── Contact resolution via AddressBook ──────────────────────────────────────
 
 
-def _load_addressbook() -> tuple[dict[str, str], dict[str, str]]:
-    """Load phone->name and name->phone mappings from the macOS AddressBook.
+def _load_addressbook() -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Load phone->name and name->phones mappings from the macOS AddressBook.
 
-    Returns (phone_to_name, name_to_phone) where phone keys are last-10-digits.
+    Returns (phone_to_name, name_to_phones) where phone keys are last-10-digits.
+    A contact with multiple numbers maps to a list of all of them — collapsing
+    to a single number is what made a name search miss a contact's other numbers
+    (e.g. a parent who switched phones but kept the same contact card).
     """
     phone_to_name: dict[str, str] = {}
-    name_to_phone: dict[str, str] = {}
+    name_to_phones: dict[str, list[str]] = {}
 
     for dbpath in glob.glob(ADDRESSBOOK_PATTERN, recursive=True):
         try:
@@ -61,25 +64,27 @@ def _load_addressbook() -> tuple[dict[str, str], dict[str, str]]:
                 digits = re.sub(r"[^\d]", "", phone)
                 if len(digits) >= 7:
                     key = digits[-10:] if len(digits) >= 10 else digits
-                    phone_to_name[key] = name
-                    name_to_phone[name.lower()] = key
+                    phone_to_name.setdefault(key, name)
+                    keys = name_to_phones.setdefault(name.lower(), [])
+                    if key not in keys:  # dedup on normalized key, not raw string
+                        keys.append(key)
             db.close()
         except Exception:
             continue
 
-    return phone_to_name, name_to_phone
+    return phone_to_name, name_to_phones
 
 
 # Module-level cache (loaded once)
 _phone_to_name: dict[str, str] | None = None
-_name_to_phone: dict[str, str] | None = None
+_name_to_phones: dict[str, list[str]] | None = None
 
 
-def _ensure_addressbook() -> tuple[dict[str, str], dict[str, str]]:
-    global _phone_to_name, _name_to_phone
+def _ensure_addressbook() -> tuple[dict[str, str], dict[str, list[str]]]:
+    global _phone_to_name, _name_to_phones
     if _phone_to_name is None:
-        _phone_to_name, _name_to_phone = _load_addressbook()
-    return _phone_to_name, _name_to_phone
+        _phone_to_name, _name_to_phones = _load_addressbook()
+    return _phone_to_name, _name_to_phones
 
 
 def resolve_name_from_phone(phone: str) -> str | None:
@@ -90,18 +95,28 @@ def resolve_name_from_phone(phone: str) -> str | None:
     return p2n.get(key)
 
 
-def resolve_phone_from_name(name: str) -> str | None:
-    """Look up a phone number by contact name (case-insensitive partial match)."""
+def resolve_phones_from_name(name: str) -> list[str]:
+    """Look up ALL phone numbers for a contact name (case-insensitive).
+
+    Exact match wins (returns just that contact's numbers, so an exact name
+    like "Sam" stays distinct from a different card "Sam Work"). Otherwise falls
+    back to a partial match, unioning the numbers of every contact whose name
+    contains the query. Returns a deduped list of last-10-digit keys, or [] if
+    no contact matches.
+    """
     _, n2p = _ensure_addressbook()
     lower = name.lower()
     # Exact match first
     if lower in n2p:
-        return n2p[lower]
-    # Partial match
-    for contact_name, phone in n2p.items():
+        return list(n2p[lower])
+    # Partial match: union numbers across every matching contact
+    keys: list[str] = []
+    for contact_name, phones in n2p.items():
         if lower in contact_name:
-            return phone
-    return None
+            for key in phones:
+                if key not in keys:
+                    keys.append(key)
+    return keys
 
 
 # ── Phone normalization ────────────────────────────────────────────────────
@@ -245,7 +260,10 @@ def find_chat_ids(
     """Find chat ROWIDs matching the contact identifier.
 
     Search order:
-      1. Phone-number match on chat_identifier (1:1 chats)
+      1. Phone-number match on chat_identifier (1:1 chats). A contact name can
+         resolve to MULTIPLE numbers (e.g. someone who switched phones); every
+         number is searched and the matching chats are unioned so a name search
+         sees all of a contact's threads, not just one number's.
       2. Display-name match (named group chats)
       3. Phone-number participant match (named + unnamed group chats)  -- fallback
          or always-on when `include_groups=True`
@@ -254,41 +272,48 @@ def find_chat_ids(
     cursor = db.cursor()
 
     digits = normalize_phone(contact)
-    is_phone = len(digits) >= 10
+    if len(digits) >= 10:
+        number_keys = [digits]
+    else:
+        number_keys = [normalize_phone(p) for p in resolve_phones_from_name(contact)]
 
-    if not is_phone:
-        phone = resolve_phone_from_name(contact)
-        if phone:
-            digits = normalize_phone(phone)
-            is_phone = True
+    if number_keys:
+        rowids: list[int] = []
+        for digits in number_keys:
+            phone_patterns = [
+                f"+{digits}",
+                f"+1{digits[-10:]}",
+                f"{digits}",
+                f"{digits[-10:]}",
+            ]
+            # 1:1 chats: chat_identifier IS the phone
+            one_to_one: list[int] = []
+            for pattern in phone_patterns:
+                cursor.execute(
+                    "SELECT ROWID FROM chat WHERE chat_identifier LIKE ?",
+                    (f"%{pattern}%",),
+                )
+                for (rid,) in cursor.fetchall():
+                    if rid not in one_to_one:
+                        one_to_one.append(rid)
 
-    if is_phone:
-        phone_patterns = [
-            f"+{digits}",
-            f"+1{digits[-10:]}",
-            f"{digits}",
-            f"{digits[-10:]}",
-        ]
-        # 1:1 chats: chat_identifier IS the phone
-        for pattern in phone_patterns:
-            cursor.execute(
-                "SELECT ROWID FROM chat WHERE chat_identifier LIKE ?",
-                (f"%{pattern}%",),
-            )
-            rows = cursor.fetchall()
-            if rows:
-                rowids = [r[0] for r in rows]
+            if one_to_one:
+                for rid in one_to_one:
+                    if rid not in rowids:
+                        rowids.append(rid)
                 if include_groups:
                     # Add group chats with the same participant
                     for gid in find_chats_with_participant(db, digits):
                         if gid not in rowids:
                             rowids.append(gid)
-                return rowids
+            else:
+                # No 1:1 for this number; fall back to participant (group) match
+                for gid in find_chats_with_participant(db, digits):
+                    if gid not in rowids:
+                        rowids.append(gid)
 
-        # No 1:1 found; fall through to participant match for unnamed groups
-        group_rowids = find_chats_with_participant(db, digits)
-        if group_rowids:
-            return group_rowids
+        if rowids:
+            return rowids
 
     # Try display name match (named group chats)
     cursor.execute(
@@ -312,14 +337,23 @@ def find_chat_ids(
 
 
 def list_chats_for_contact(db: sqlite3.Connection, contact: str) -> list[int]:
-    """Return every chat (1:1 + named groups + unnamed groups) involving a contact."""
+    """Return every chat (1:1 + named groups + unnamed groups) involving a contact.
+
+    Unions across all of a contact's numbers when resolving by name.
+    """
     digits = normalize_phone(contact)
-    if len(digits) < 10:
-        phone = resolve_phone_from_name(contact)
-        if not phone:
+    if len(digits) >= 10:
+        number_keys = [digits]
+    else:
+        number_keys = [normalize_phone(p) for p in resolve_phones_from_name(contact)]
+        if not number_keys:
             return []
-        digits = normalize_phone(phone)
-    return find_chats_with_participant(db, digits)
+    rowids: list[int] = []
+    for digits in number_keys:
+        for rid in find_chats_with_participant(db, digits):
+            if rid not in rowids:
+                rowids.append(rid)
+    return rowids
 
 
 def get_chat_participants(db: sqlite3.Connection, chat_id: int) -> dict[int, str]:
@@ -661,6 +695,16 @@ def main():
             for cid, name in cursor.fetchall():
                 print(f"  {name}", file=sys.stderr)
             sys.exit(1)
+        if len(chat_ids) > 1:
+            # We resolved the name/number to several threads (e.g. a contact with
+            # multiple numbers) and merge them by timestamp below — say so, so a
+            # mixed timeline isn't mistaken for a single thread.
+            print(
+                f"Note: '{args.contact}' resolved to {len(chat_ids)} chats "
+                f"(ROWIDs {', '.join(str(c) for c in chat_ids)}); merging by time. "
+                f"Use --list-chats to see them individually.",
+                file=sys.stderr,
+            )
 
     # Get participants for group chats
     participants = {}

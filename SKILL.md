@@ -4,7 +4,7 @@ description: Read iMessage, SMS, and RCS conversations from the macOS Messages d
 license: MIT
 metadata:
   author: br-schneider
-  version: "1.2.0"
+  version: "1.3.0"
 ---
 
 # iMessage Reader
@@ -35,7 +35,7 @@ python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
 ```
 
 ### Contact formats
-- **Contact name**: `"Mom"`, `"John Smith"` (looks up phone in macOS AddressBook, partial match works)
+- **Contact name**: `"Mom"`, `"John Smith"` (looks up phone in macOS AddressBook, partial match works). If a contact card has **multiple numbers** (e.g. someone who switched phones but kept the card), all of them are searched and the threads are merged by timestamp — so you see the latest messages even if they came in on a newer number.
 - **Phone number**: `"+15551234567"`, `"(555) 123-4567"`, `"5551234567"`
 - **Group chat name**: `"Family"`, `"Work Chat"` (partial match on group display name)
 - **Specific chat by ID**: `--chat-id N` (use `--list-chats` to discover IDs; works for unnamed groups)
@@ -102,7 +102,7 @@ When the user says things like "read my messages with Mom" or "what did John tex
 3. Run the script
 4. Present the conversation to the user, and work with the content as requested
 
-The script resolves contact names from the macOS AddressBook automatically. If a name doesn't match, try a phone number instead.
+The script resolves contact names from the macOS AddressBook automatically, including contacts with more than one phone number (all are searched and merged). If a name doesn't match, try a phone number instead. When a name resolves to multiple threads, the script prints a one-line note to stderr listing the ROWIDs so you can tell a merged timeline from a single thread.
 
 ### When the default search fails
 
