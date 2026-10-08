@@ -1,117 +1,52 @@
 ---
 name: imessage
-description: Read iMessage, SMS, and RCS conversations from the macOS Messages database. Use when the user asks to read texts, check messages, see what someone said, or look at a group chat. Handles all message types including RCS blobs, resolves contact names from AddressBook, surfaces attachment paths inline (with optional HEIC→JPEG conversion), and filters by date.
+description: Read iMessage, SMS, and RCS conversations from the macOS Messages database. Use when the user asks to read texts, check messages, see what someone said, find a group chat, follow a conversation as it happens, or search old texts. Resolves contact names from AddressBook, surfaces attachment paths inline (with optional HEIC→JPEG conversion), and filters by date or time.
 license: MIT
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/imessage-reader.py *)
 metadata:
   author: br-schneider
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # iMessage Reader
 
-Read iMessage, SMS, and RCS conversations from the local macOS Messages database.
-
-## Usage
-
-Find and run the reader script:
+Run the bundled script directly, with no lookup step first:
 
 ```bash
-# Find the script (works for both skills.sh install and manual install)
-IMSG_SCRIPT="$(find ~/.claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-[ -z "$IMSG_SCRIPT" ] && IMSG_SCRIPT="$(find .claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-python3 "$IMSG_SCRIPT" "<contact>" [options]
+python3 ${CLAUDE_SKILL_DIR}/scripts/imessage-reader.py "<contact>" [options]
 ```
 
-Or reference it directly if you know the install path:
-```bash
-# skills.sh install (project-level)
-python3 .claude/skills/imessage/scripts/imessage-reader.py "<contact>" [options]
+If `${CLAUDE_SKILL_DIR}` reached you unexpanded (an agent other than Claude Code), the script is `scripts/imessage-reader.py` in the directory holding this `SKILL.md`; use that absolute path.
 
-# skills.sh install (global)
-python3 ~/.claude/skills/imessage/scripts/imessage-reader.py "<contact>" [options]
+## Pick the target
 
-# Manual install
-python3 ~/.claude/scripts/imessage-reader.py "<contact>" [options]
-```
+- **A person**: their contact name (`"Mom"`, `"John Smith"`, partial match works) or a phone number in any format. Every number on the contact card is searched and that person's 1:1 threads merge into one timeline. When a partial name matches several people, each person gets their own section.
+- **A named group**: its display name (`"Family"`).
+- **Anything else** (an unnamed group, a short code, a sender who isn't a contact, "the chat with Dad and Eric"): run `--list-chats`, then read it with `--chat-id N`.
+  - `--list-chats "<contact>"` lists every chat that person is in, newest first.
+  - `--list-chats` with no contact lists the 25 most recently active chats across the whole database. Narrow it with `--today` or `--days N`, or change the count with `--limit N`.
+  - Each line shows the ROWID, the participants, the number for a 1:1, and when and how the last message arrived (`last: 2026-10-07 18:59 via iMessage`). That last part tells you which of someone's numbers they are using now.
+- **Several chats at once**: repeat `--chat-id` (`--chat-id 2618 --chat-id 2631`). Each chat prints in its own section.
+- `--include-groups` adds every group the person is in to a contact search, one section per group. A contact search alone reads only the 1:1, so add it whenever the question is about a person rather than one thread ("what has Maddie said today", "anything from Dad").
 
-### Contact formats
-- **Contact name**: `"Mom"`, `"John Smith"` (looks up phone in macOS AddressBook, partial match works). If a contact card has **multiple numbers** (e.g. someone who switched phones but kept the card), all of them are searched and the threads are merged by timestamp — so you see the latest messages even if they came in on a newer number.
-- **Phone number**: `"+15551234567"`, `"(555) 123-4567"`, `"5551234567"`
-- **Group chat name**: `"Family"`, `"Work Chat"` (partial match on group display name)
-- **Specific chat by ID**: `--chat-id N` (use `--list-chats` to discover IDs; works for unnamed groups)
+## Pick the range
 
-### Time range options
-- `--today` — today's messages (default if no range specified)
-- `--days N` — last N days
-- `--date YYYY-MM-DD` — specific date
-- `--all --limit N` — all messages, most recent N (default limit: 100)
+- `--today` is the default.
+- `--date YYYY-MM-DD` covers one calendar day.
+- `--days N` covers a rolling N×24 hours back from now.
+- `--all` covers the whole history.
+- `--since HH:MM` (today) or `--since "YYYY-MM-DD HH:MM"` shows every message from that minute on. **When following a live conversation, re-run with `--since` set to the time of the last message you saw.** It replaces piping output through `awk`, `sed`, or `tail`, which cut multi-line messages in half. `--since` is inclusive, so the last message you saw prints again as the first line.
+- `--search TEXT` keeps only messages whose text contains TEXT (case-insensitive). Combine it with `--all` to search a person's whole history; day headers stay in, so every match keeps its date.
+- `--limit N` keeps the newest N messages. The default is 100 for `--days` and `--all` and unlimited otherwise. When the limit cuts anything, the first line of output says `(showing the newest N of M messages in range ...)`; raise `--limit` or narrow the range when you need the rest.
 
-### Discovery options
-- `--list-chats <contact>` — list every chat involving the contact (1:1 + named groups + **unnamed groups**), with each chat's ROWID and last-activity date. Use this when you know someone is in a group chat but don't know its name. Exits after printing.
-- `--chat-id N` — read a specific chat by ROWID. Pair with `--list-chats` to read an unnamed group chat that the default contact search can't reach.
-- `--include-groups` — when searching by contact, return the 1:1 chat AND all group chats containing that contact (instead of just the 1:1). Useful for "show me everything with this person."
+## Attachments
 
-### Attachment options
-- `--convert-heic` — auto-convert HEIC attachments to JPEG (cached in `/tmp/imessage-attachments/<rowid>-<basename>.jpg`) so the output includes a readable JPEG path alongside the original HEIC. Required when the agent needs to actually read the image content (HEIC is not directly readable by most image tools). Cached and idempotent across re-runs.
+Attachments print inline as `[attachment: <mime>, <absolute path>]`; read the path directly. Pass `--convert-heic` whenever you need to look at photos: HEIC files are converted to JPEG (cached in `/tmp/imessage-attachments/`) and the token gains `| converted: <jpeg path>`.
 
-### Examples
+## When a read comes back empty
 
-```bash
-IMSG="$(find ~/.claude .claude -name imessage-reader.py -path '*/imessage*' 2>/dev/null | head -1)"
-python3 "$IMSG" "Mom" --today
-python3 "$IMSG" "Family" --days 7
-python3 "$IMSG" "John Smith" --date 2026-03-29
-python3 "$IMSG" "Work Chat" --all --limit 50
-python3 "$IMSG" "+15551234567" --today
-
-# Discover and read an unnamed group chat
-python3 "$IMSG" "John Smith" --list-chats        # prints all chats including unnamed groups
-python3 "$IMSG" --chat-id 2816 --today           # read the unnamed group directly
-
-# Read everything (1:1 + all groups) with a contact
-python3 "$IMSG" "John Smith" --include-groups --days 7
-
-# Pull a thread AND auto-convert any HEIC images so the JPEGs are read-ready
-python3 "$IMSG" "Mom" --today --convert-heic
-```
-
-## How it works
-
-The script reads `~/Library/Messages/chat.db` (the macOS iMessage SQLite database). It handles:
-- **iMessage**: text stored in the `text` column
-- **SMS/RCS**: text stored in the `attributedBody` blob (Apple typedstream format), decoded with proper multi-byte length support for messages of any length
-- **Contact names**: resolved from the macOS AddressBook SQLite database (supports name-based lookup and display)
-- **Tapback reactions**: filtered out automatically
-- **Attachments**: surfaced inline as `[attachment: <mime>, <absolute_path>]` tokens. Messages with 0–1 attachments stay on one line; messages with 2+ attachments use indented continuation lines for readability. The iOS U+FFFC placeholder character is stripped automatically. Link-preview rows (`.pluginPayloadAttachment` with no MIME) and hidden attachments are filtered out.
-- **HEIC handling**: HEIC files are not directly readable by most image tools. Pass `--convert-heic` to auto-convert via macOS `sips` and surface a JPEG path alongside the original. Conversions are cached at `/tmp/imessage-attachments/<rowid>-<basename>.jpg` and reused on subsequent runs.
-- **Group chats**: resolves participant names from AddressBook where possible
-- **Read-only**: opens databases in read-only mode for safety
+The script explains why on stderr: when each matched chat last had activity, any other chats with that person that do have messages in range, and other contacts whose names contain the query. Follow that hint (usually `--chat-id N` or a wider range) instead of querying `chat.db` yourself.
 
 ## Requirements
 
-- macOS 14+ with Messages.app signed in
-- Full Disk Access for your terminal (System Settings > Privacy & Security > Full Disk Access)
-- Python 3.10+ (no external dependencies, stdlib only)
-
-## When the user asks
-
-When the user says things like "read my messages with Mom" or "what did John text me today" or "show me the Family group chat from last week":
-
-1. Figure out the contact identifier (phone number, group name, or contact name)
-2. Figure out the time range (default to today if not specified)
-3. Run the script
-4. Present the conversation to the user, and work with the content as requested
-
-The script resolves contact names from the macOS AddressBook automatically, including contacts with more than one phone number (all are searched and merged). If a name doesn't match, try a phone number instead. When a name resolves to multiple threads, the script prints a one-line note to stderr listing the ROWIDs so you can tell a merged timeline from a single thread.
-
-### When the default search fails
-
-If a user asks about a thread you know exists but `<contact>` returns "No chat found", it's almost certainly an **unnamed group chat** — Apple stores its `chat.chat_identifier` as a GUID and `display_name` is empty, so neither the name nor phone-number searches find it.
-
-Recover with:
-
-```bash
-python3 "$IMSG" "<contact>" --list-chats
-```
-
-This lists every chat the contact appears in, including unnamed groups, with each chat's ROWID. Then read the right one with `--chat-id N`. If the user describes a chat by its participants ("the group chat with Dad and Jorge"), `--list-chats` on either participant will surface it.
+macOS 14+ with Messages signed in, Full Disk Access for the terminal app (System Settings > Privacy & Security > Full Disk Access), and Python 3.10+ (stdlib only). The databases are opened read-only.

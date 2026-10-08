@@ -8,16 +8,13 @@ An [Agent Skill](https://skills.sh) that lets AI agents read your iMessage, SMS,
 npx skills add br-schneider/imessage-skill
 ```
 
-Or manually copy to your agent's skill directory:
+Or copy the whole folder into your agent's skills directory, keeping `scripts/` next to `SKILL.md`:
 ```bash
 # Claude Code (global)
-cp SKILL.md ~/.claude/commands/imessage.md
-cp scripts/imessage-reader.py ~/.claude/scripts/imessage-reader.py
+cp -R . ~/.claude/skills/imessage
 
 # Claude Code (project)
-cp SKILL.md .claude/skills/imessage.md
-mkdir -p .claude/scripts
-cp scripts/imessage-reader.py .claude/scripts/imessage-reader.py
+cp -R . .claude/skills/imessage
 ```
 
 ## What it does
@@ -26,7 +23,12 @@ cp scripts/imessage-reader.py .claude/scripts/imessage-reader.py
 - Decodes all message types: iMessage, SMS, and RCS (including `attributedBody` blobs with multi-byte length encoding)
 - Resolves contact names from the macOS AddressBook database
 - Filters by contact name, phone number, or group chat name
-- Filters by date (today, last N days, specific date)
+- Filters by date (today, last N days, specific date) or from a time onward (`--since 14:30`), so an agent can follow a live conversation without re-reading it
+- Searches message text (`--search`), keeping each match's date
+- Lists chats newest first, for one person or across the whole database, with each chat's ROWID and when and how its last message arrived
+- Reads several chats in one call (repeat `--chat-id`), each in its own section
+- `--limit` always keeps the newest messages and says so when it cuts anything
+- When a read comes back empty, explains why and points at the chat that does have messages
 - Surfaces attachments inline as `[attachment: <mime>, <absolute_path>]` so the agent can read the file directly (filters out link-preview rows automatically)
 - Optional `--convert-heic` flag to auto-convert HEIC to JPEG via `sips`, with idempotent caching at `/tmp/imessage-attachments/<rowid>-<basename>.jpg`
 - Read-only database access, zero external dependencies (Python stdlib only)
@@ -39,6 +41,8 @@ Once installed, ask your agent naturally:
 - "What did John text me today?"
 - "Show me the Family group chat from last week"
 - "Read my texts with +15551234567 from March 29"
+- "Anything new from Dad since 2pm?"
+- "Find the TikTok Maddie sent me last month"
 
 The agent will run the script and present the conversation.
 

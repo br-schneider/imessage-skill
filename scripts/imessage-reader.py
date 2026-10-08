@@ -24,6 +24,8 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
+from typing import Any
 
 MESSAGES_DB = os.path.expanduser("~/Library/Messages/chat.db")
 ADDRESSBOOK_PATTERN = os.path.expanduser(
@@ -120,6 +122,43 @@ def resolve_phones_from_name(name: str) -> list[str]:
 
 
 # ── Phone normalization ────────────────────────────────────────────────────
+
+
+def matching_contact_names(name: str) -> list[str]:
+    p2n, n2p = _ensure_addressbook()
+    lower = name.lower()
+    proper = {n.lower(): n for n in p2n.values()}
+    return sorted(proper.get(k, k) for k in n2p if lower in k)
+
+
+APPLE_EPOCH = 978307200
+
+
+def apple_to_datetime(value: int) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(value / 1e9 + APPLE_EPOCH)
+
+
+def datetime_to_apple(value: datetime.datetime) -> int:
+    return int((value.timestamp() - APPLE_EPOCH) * 1e9)
+
+
+def parse_since(raw: str) -> datetime.datetime:
+    raw = raw.strip()
+    today = datetime.date.today()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            t = datetime.datetime.strptime(raw, fmt).time()
+            return datetime.datetime.combine(today, t)
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(
+        f"can't read --since {raw!r}; use HH:MM (today) or 'YYYY-MM-DD HH:MM'"
+    )
 
 
 def normalize_phone(raw: str) -> str:
@@ -227,29 +266,82 @@ def describe_chat(db: sqlite3.Connection, chat_id: int) -> str:
     participants = get_chat_participants(db, chat_id)
     names = sorted(set(participants.values()))
 
-    # Last activity date
     cursor.execute(
         """
-        SELECT MAX(m.date) FROM message m
+        SELECT m.date, m.service FROM message m
         JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
         WHERE cmj.chat_id = ?
+        ORDER BY m.date DESC LIMIT 1
         """,
         (chat_id,),
     )
     last_row = cursor.fetchone()
     last_str = ""
     if last_row and last_row[0]:
-        ts = datetime.datetime.fromtimestamp(last_row[0] / 1e9 + 978307200)
-        last_str = f"  last: {ts.date().isoformat()}"
+        last_str = f"  last: {apple_to_datetime(last_row[0]).strftime('%Y-%m-%d %H:%M')}"
+        if last_row[1]:
+            last_str += f" via {last_row[1]}"
 
     if display_name:
         kind = f'group: "{display_name}"'
     elif len(names) <= 1:
-        kind = f"1:1 with {names[0] if names else chat_identifier}"
+        name = names[0] if names else chat_identifier
+        kind = f"1:1 with {name}" if name == chat_identifier else f"1:1 with {name} ({chat_identifier})"
     else:
         kind = f"group (unnamed, {len(names)} participants: {', '.join(names)})"
 
     return f"[{chat_id}] {kind}{last_str}"
+
+
+def is_group_chat(db: sqlite3.Connection, chat_id: int) -> bool:
+    cursor = db.cursor()
+    cursor.execute("SELECT display_name FROM chat WHERE ROWID = ?", (chat_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        return True
+    return len(set(get_chat_participants(db, chat_id).values())) > 1
+
+
+def chats_by_recent_activity(
+    db: sqlite3.Connection,
+    chat_ids: list[int] | None = None,
+    since: datetime.datetime | None = None,
+    limit: int | None = None,
+    until: datetime.datetime | None = None,
+) -> list[int]:
+    where: list[str] = []
+    params: list[int] = []
+    if until is not None:
+        where.append("m.date < ?")
+        params.append(datetime_to_apple(until))
+    if chat_ids is not None:
+        if not chat_ids:
+            return []
+        where.append(f"cmj.chat_id IN ({','.join('?' * len(chat_ids))})")
+        params.extend(chat_ids)
+    having = ""
+    if since is not None:
+        having = "HAVING MAX(m.date) >= ?"
+        params.append(datetime_to_apple(since))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    limit_sql = f"LIMIT {int(limit)}" if limit else ""
+    cursor = db.cursor()
+    cursor.execute(
+        f"""
+        SELECT cmj.chat_id, MAX(m.date) FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        {where_sql}
+        GROUP BY cmj.chat_id
+        {having}
+        ORDER BY MAX(m.date) DESC
+        {limit_sql}
+        """,
+        params,
+    )
+    ranked = [r[0] for r in cursor.fetchall()]
+    if chat_ids is not None and since is None:
+        ranked += [c for c in chat_ids if c not in ranked]
+    return ranked
 
 
 def find_chat_ids(
@@ -353,7 +445,7 @@ def list_chats_for_contact(db: sqlite3.Connection, contact: str) -> list[int]:
         for rid in find_chats_with_participant(db, digits):
             if rid not in rowids:
                 rowids.append(rid)
-    return rowids
+    return chats_by_recent_activity(db, rowids)
 
 
 def get_chat_participants(db: sqlite3.Connection, chat_id: int) -> dict[int, str]:
@@ -508,11 +600,11 @@ def render_message_line(
 def read_messages(
     db: sqlite3.Connection,
     chat_ids: list[int],
-    date_filter: str | None = None,
-    days: int | None = None,
+    start: datetime.datetime | None = None,
+    end: datetime.datetime | None = None,
+    search: str | None = None,
     limit: int | None = None,
-) -> list[dict]:
-    """Read messages from the given chat IDs."""
+) -> tuple[list[dict], int]:
     cursor = db.cursor()
 
     placeholders = ",".join("?" * len(chat_ids))
@@ -522,59 +614,32 @@ def read_messages(
     # Skip tapback reactions
     where_clauses.append("m.associated_message_type = 0")
 
-    if date_filter:
-        where_clauses.append(
-            "date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') = ?"
-        )
-        params.append(date_filter)
-    elif days:
-        where_clauses.append(
-            "m.date/1000000000 + 978307200 > unixepoch('now', ?)"
-        )
-        params.append(f"-{days} days")
+    if start is not None:
+        where_clauses.append("m.date >= ?")
+        params.append(datetime_to_apple(start))
+    if end is not None:
+        where_clauses.append("m.date < ?")
+        params.append(datetime_to_apple(end))
 
-    where_sql = " AND ".join(where_clauses)
-    limit_sql = f"LIMIT {limit}" if limit else ""
-
-    if limit and not date_filter and not days:
-        query = f"""
-            SELECT * FROM (
-                SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
-                       m.handle_id, m.cache_has_attachments
-                FROM message m
-                JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-                WHERE {where_sql}
-                ORDER BY m.date DESC
-                {limit_sql}
-            ) ORDER BY date ASC
-        """
-    else:
-        query = f"""
-            SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
-                   m.handle_id, m.cache_has_attachments
-            FROM message m
-            JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-            WHERE {where_sql}
-            ORDER BY m.date ASC
-            {limit_sql}
-        """
-
-    cursor.execute(query, params)
+    cursor.execute(
+        f"""
+        SELECT DISTINCT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
+               m.handle_id, m.cache_has_attachments
+        FROM message m
+        JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+        WHERE {" AND ".join(where_clauses)}
+        ORDER BY m.date ASC
+        """,
+        params,
+    )
     rows = cursor.fetchall()
 
-    # Batch-fetch attachments for messages that flag them.
-    rowids_with_atts = [r[0] for r in rows if r[6]]
-    atts_by_msg = get_attachments_for_messages(db, rowids_with_atts)
-
-    messages = []
+    needle = search.lower() if search else None
+    decoded = []
     for rowid, date_val, is_from_me, text, attributed_body, handle_id, has_attach in rows:
-        ts = datetime.datetime.fromtimestamp(date_val / 1e9 + 978307200)
-
         msg = text
         if not msg and attributed_body:
             msg = extract_text_from_blob(attributed_body)
-
-        attachments = atts_by_msg.get(rowid, [])
 
         # Strip iOS's U+FFFC OBJECT REPLACEMENT CHARACTER — it's the inline
         # placeholder for "attachment goes here". Once we render the attachment
@@ -585,6 +650,23 @@ def read_messages(
             msg = "\n".join(re.sub(r" +", " ", line).strip() for line in msg.split("\n"))
             msg = msg.strip()
 
+        if needle and needle not in (msg or "").lower():
+            continue
+        if not msg and not has_attach:
+            continue
+        decoded.append((rowid, date_val, is_from_me, msg, handle_id, has_attach))
+
+    total = len(decoded)
+    if limit and total > limit:
+        decoded = decoded[-limit:]
+
+    # Batch-fetch attachments for messages that flag them.
+    atts_by_msg = get_attachments_for_messages(db, [d[0] for d in decoded if d[5]])
+
+    messages = []
+    for rowid, date_val, is_from_me, msg, handle_id, _ in decoded:
+        attachments = atts_by_msg.get(rowid, [])
+
         # Skip messages with neither text nor resolvable attachments.
         # (has_attach=1 with no resolvable attachments usually means the only
         # "attachment" was a link preview, which we filter out.)
@@ -592,40 +674,86 @@ def read_messages(
             continue
 
         messages.append({
-            "timestamp": ts,
+            "timestamp": apple_to_datetime(date_val),
             "is_from_me": bool(is_from_me),
             "text": msg or "",
             "handle_id": handle_id,
             "attachments": attachments,
         })
 
-    return messages
+    return messages, total
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 
+def print_messages(messages: list[dict[str, Any]], resolve_sender: Callable[[int], str], convert_heic: bool) -> None:
+    current_date = None
+    for msg in messages:
+        msg_date = msg["timestamp"].date()
+        if msg_date != current_date:
+            current_date = msg_date
+            print(f"\n--- {msg_date.strftime('%A, %B %d, %Y')} ---\n")
+        sender = "You" if msg["is_from_me"] else resolve_sender(msg["handle_id"])
+        print(render_message_line(
+            msg["timestamp"].strftime("%H:%M"), sender, msg["text"], msg["attachments"], convert_heic
+        ))
+
+
+def resolve_sender_for_chat(db: sqlite3.Connection, chat_id: int) -> str:
+    return next(iter(get_chat_participants(db, chat_id).values()), str(chat_id))
+
+
+def print_chat_list(db: sqlite3.Connection, title: str, rowids: list[int]) -> None:
+    print(title)
+    for rid in rowids:
+        print(f"  {describe_chat(db, rid)}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Read iMessage/SMS/RCS conversations")
+    parser = argparse.ArgumentParser(
+        description="Read iMessage/SMS/RCS conversations",
+        epilog=(
+            "Range: --today (default), --date, --days, --since, or --all. "
+            "--since HH:MM shows everything from that minute on, ready for checking what is new."
+        ),
+    )
     parser.add_argument(
         "contact",
         nargs="?",
         help="Phone number, contact name, or group chat name (omit if using --chat-id)",
     )
-    parser.add_argument("--today", action="store_true", help="Today's messages only")
-    parser.add_argument("--days", type=int, help="Messages from last N days")
-    parser.add_argument("--date", help="Messages from specific date (YYYY-MM-DD)")
-    parser.add_argument("--all", action="store_true", help="All messages (use with --limit)")
-    parser.add_argument("--limit", type=int, default=100, help="Max messages (default: 100)")
+    parser.add_argument("--today", action="store_true", help="Today's messages only (the default range)")
+    parser.add_argument("--days", type=int, help="Messages from the last N days (rolling, N*24 hours back from now)")
+    parser.add_argument("--date", help="Messages from one calendar day (YYYY-MM-DD)")
+    parser.add_argument(
+        "--since",
+        type=parse_since,
+        help="Messages at or after a time: HH:MM (today) or 'YYYY-MM-DD HH:MM'",
+    )
+    parser.add_argument("--all", action="store_true", help="The whole history (newest --limit messages)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Keep the newest N messages (default: 100 for --days and --all, unlimited otherwise). "
+            "With --list-chats: number of chats (default 25)."
+        ),
+    )
+    parser.add_argument("--search", help="Only messages whose text contains this (case-insensitive)")
     parser.add_argument(
         "--chat-id",
         type=int,
-        help="Read a specific chat by ROWID (use --list-chats to discover IDs)",
+        action="append",
+        help="Read a chat by ROWID; repeat for several chats, each printed in its own section",
     )
     parser.add_argument(
         "--list-chats",
         action="store_true",
-        help="List every chat (1:1 + named + unnamed groups) involving the contact, then exit",
+        help=(
+            "List chats newest first, then exit: every chat involving the contact, "
+            "or with no contact the most recently active chats"
+        ),
     )
     parser.add_argument(
         "--include-groups",
@@ -648,97 +776,103 @@ def main():
         print(f"Error: iMessage database not found at {MESSAGES_DB}", file=sys.stderr)
         sys.exit(1)
 
-    if not args.contact and args.chat_id is None:
-        parser.error("provide a contact name/phone OR a --chat-id")
+    if not args.contact and not args.chat_id and not args.list_chats:
+        parser.error("provide a contact name/phone, a --chat-id, or --list-chats")
 
-    db = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
+    try:
+        db = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
+        db.execute("SELECT 1 FROM message LIMIT 1")
+    except sqlite3.Error as exc:
+        print(
+            f"Error: can't read {MESSAGES_DB} ({exc}). Grant Full Disk Access to the app running "
+            "this terminal: System Settings > Privacy & Security > Full Disk Access.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    # --list-chats: discovery mode (lists chats with a given participant, then exits)
+    now = datetime.datetime.now()
+    today_start = datetime.datetime.combine(datetime.date.today(), datetime.time())
+    start: datetime.datetime | None = None
+    end: datetime.datetime | None = None
+    default_limit = None
+    if args.date:
+        try:
+            day = datetime.datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            parser.error(f"--date expects YYYY-MM-DD, got {args.date!r}")
+        start, end = day, day + datetime.timedelta(days=1)
+    elif args.days:
+        start = now - datetime.timedelta(days=args.days)
+        default_limit = 100
+    elif args.all:
+        default_limit = 100
+    elif not args.since:
+        start = today_start
+    if args.since:
+        start = args.since if start is None else max(start, args.since)
+    limit = args.limit if args.limit is not None else default_limit
+
     if args.list_chats:
-        if not args.contact:
-            parser.error("--list-chats requires a contact name or phone number")
-        rowids = list_chats_for_contact(db, args.contact)
-        if not rowids:
-            print(f"No chats found involving '{args.contact}'", file=sys.stderr)
-            sys.exit(1)
-        print(f"Chats involving '{args.contact}':", file=sys.stderr)
-        for rid in rowids:
-            print(f"  {describe_chat(db, rid)}", file=sys.stderr)
+        if args.contact:
+            rowids = list_chats_for_contact(db, args.contact)
+            if not rowids:
+                print(f"No chats found involving '{args.contact}'", file=sys.stderr)
+                sys.exit(1)
+            print_chat_list(db, f"Chats involving '{args.contact}', newest first:", rowids[: args.limit] if args.limit else rowids)
+        else:
+            since = start if (args.days or args.since or args.date or args.today) else None
+            rowids = chats_by_recent_activity(db, since=since, limit=args.limit or 25)
+            print_chat_list(db, "Most recently active chats:", rowids)
         sys.exit(0)
 
-    # --chat-id: read a specific chat directly (bypasses contact search)
-    if args.chat_id is not None:
+    if args.chat_id:
         cursor = db.cursor()
-        cursor.execute("SELECT ROWID FROM chat WHERE ROWID = ?", (args.chat_id,))
-        if not cursor.fetchone():
-            print(f"No chat with ROWID {args.chat_id}", file=sys.stderr)
-            sys.exit(1)
-        chat_ids = [args.chat_id]
+        for cid in args.chat_id:
+            cursor.execute("SELECT ROWID FROM chat WHERE ROWID = ?", (cid,))
+            if not cursor.fetchone():
+                print(f"No chat with ROWID {cid}", file=sys.stderr)
+                sys.exit(1)
+        sections = [[cid] for cid in dict.fromkeys(args.chat_id)]
     else:
         chat_ids = find_chat_ids(db, args.contact, include_groups=args.include_groups)
         if not chat_ids:
-            print(f"No chat found matching '{args.contact}'", file=sys.stderr)
+            print(f"No chat found matching '{args.contact}'.", file=sys.stderr)
+            names = matching_contact_names(args.contact)
+            if names:
+                print(f"Contacts matching it: {', '.join(names[:10])}", file=sys.stderr)
             print(
-                f"\nTip: try `--list-chats {args.contact!r}` to see every chat involving them,",
+                "If it is a group or a sender that isn't a contact, pick its ROWID below "
+                "and rerun with --chat-id N.",
                 file=sys.stderr,
             )
-            print(
-                "including unnamed group chats which the default search may miss.",
-                file=sys.stderr,
-            )
-            cursor = db.cursor()
-            cursor.execute("""
-                SELECT chat_identifier, display_name FROM chat
-                WHERE display_name <> '' ORDER BY ROWID DESC LIMIT 20
-            """)
-            print("\nRecent named group chats:", file=sys.stderr)
-            for cid, name in cursor.fetchall():
-                print(f"  {name}", file=sys.stderr)
+            print_chat_list(db, "Most recently active chats:", chats_by_recent_activity(db, limit=15))
             sys.exit(1)
+        by_person: dict[str, list[int]] = {}
+        groups: list[int] = []
+        for cid in chat_ids:
+            if is_group_chat(db, cid):
+                groups.append(cid)
+            else:
+                person = resolve_sender_for_chat(db, cid)
+                by_person.setdefault(person, []).append(cid)
+        sections = list(by_person.values()) + [[c] for c in groups]
         if len(chat_ids) > 1:
             # We resolved the name/number to several threads (e.g. a contact with
             # multiple numbers) and merge them by timestamp below — say so, so a
             # mixed timeline isn't mistaken for a single thread.
+            merged = [f"{p} ({', '.join(str(c) for c in ids)})" for p, ids in by_person.items() if len(ids) > 1]
             print(
-                f"Note: '{args.contact}' resolved to {len(chat_ids)} chats "
-                f"(ROWIDs {', '.join(str(c) for c in chat_ids)}); merging by time. "
-                f"Use --list-chats to see them individually.",
+                f"Note: '{args.contact}' matched {len(chat_ids)} chats. "
+                + (f"Merged by time per person: {'; '.join(merged)}. " if merged else "")
+                + ("Each other person or group gets its own section." if len(sections) > 1 else ""),
                 file=sys.stderr,
             )
 
-    # Get participants for group chats
-    participants = {}
-    for cid in chat_ids:
-        participants.update(get_chat_participants(db, cid))
+    participants: dict[int, str] = {}
 
-    # Determine date filter
-    date_filter = None
-    days = None
-    if args.today:
-        date_filter = datetime.date.today().isoformat()
-    elif args.date:
-        date_filter = args.date
-    elif args.days:
-        days = args.days
-    elif not args.all:
-        date_filter = datetime.date.today().isoformat()
-
-    messages = read_messages(
-        db, chat_ids,
-        date_filter=date_filter,
-        days=days,
-        limit=args.limit if not date_filter else None,
-    )
-
-    if not messages:
-        print("No messages found for the given criteria.", file=sys.stderr)
-        sys.exit(0)
-
-    # Build a handle_id -> name resolver with on-the-fly fallback
     def resolve_sender(handle_id: int) -> str:
         if handle_id in participants:
             return participants[handle_id]
-        # Fallback: look up handle directly from the handle table
         cur = db.cursor()
         cur.execute("SELECT id FROM handle WHERE ROWID = ?", (handle_id,))
         row = cur.fetchone()
@@ -747,27 +881,46 @@ def main():
             resolved = name if name else row[0]
         else:
             resolved = "Other"
-        participants[handle_id] = resolved  # cache for next time
+        participants[handle_id] = resolved
         return resolved
 
-    # Print conversation
-    current_date = None
-    for msg in messages:
-        msg_date = msg["timestamp"].date()
-        if msg_date != current_date:
-            current_date = msg_date
-            print(f"\n--- {msg_date.strftime('%A, %B %d, %Y')} ---\n")
+    found_any = False
+    for section in sections:
+        for cid in section:
+            participants.update(get_chat_participants(db, cid))
+        messages, total = read_messages(db, section, start=start, end=end, search=args.search, limit=limit)
+        label = describe_chat(db, section[0]) if len(section) == 1 else (
+            f"{resolve_sender_for_chat(db, section[0])}, 1:1 threads {', '.join(str(c) for c in section)} merged"
+        )
+        if not messages:
+            if len(sections) > 1 and args.chat_id:
+                print(f"\n=== {label} ===\n(no messages in range)")
+            continue
+        if len(sections) > 1:
+            print(f"\n=== {label} ===")
+        found_any = True
+        if total > len(messages) and limit and total > limit:
+            kind = f"messages matching {args.search!r}" if args.search else "messages in range"
+            print(f"(showing the newest {limit} of {total} {kind}; raise --limit or narrow the range for more)")
+        print_messages(messages, resolve_sender, args.convert_heic)
 
-        time_str = msg["timestamp"].strftime("%H:%M")
-
-        if msg["is_from_me"]:
-            sender = "You"
-        else:
-            sender = resolve_sender(msg["handle_id"])
-
-        print(render_message_line(
-            time_str, sender, msg["text"], msg["attachments"], args.convert_heic
-        ))
+    if not found_any:
+        sys.stdout.flush()
+        all_ids = [c for s in sections for c in s]
+        if len(sections) == 1 or not args.chat_id:
+            print("No messages found for the given criteria. Last activity:", file=sys.stderr)
+            for cid in all_ids:
+                print(f"  {describe_chat(db, cid)}", file=sys.stderr)
+        if args.contact and not args.chat_id and start is not None:
+            others = [c for c in list_chats_for_contact(db, args.contact) if c not in all_ids]
+            active = chats_by_recent_activity(db, others, since=start, until=end)
+            if active:
+                print("Other chats with them that do have messages in range (read with --chat-id N):", file=sys.stderr)
+                for cid in active:
+                    print(f"  {describe_chat(db, cid)}", file=sys.stderr)
+            names = [n for n in matching_contact_names(args.contact) if n.lower() != args.contact.lower()]
+            if names:
+                print(f"Other contacts containing '{args.contact}': {', '.join(names[:10])}", file=sys.stderr)
 
     db.close()
 
